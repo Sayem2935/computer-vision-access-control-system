@@ -1,4 +1,5 @@
 import argparse
+import os
 import threading
 import time
 
@@ -7,7 +8,7 @@ import face_recognition
 
 from api_sender import send_exit_to_api
 from camera import DEFAULT_RTSP_URL
-from database import DB_PATH, PeopleDatabase, get_person, match_person, remove_person
+from database import DB_PATH, PeopleDatabase
 from recognition import extract_face_encoding
 
 
@@ -18,6 +19,26 @@ def parse_args():
     parser.add_argument("--rtsp", default=DEFAULT_RTSP_URL, help="RTSP stream URL.")
     parser.add_argument("--database", default=DB_PATH, help="SQLite database path.")
     parser.add_argument("--width", type=int, default=960, help="Resize frame width.")
+    parser.add_argument(
+        "--recognition-interval",
+        type=int,
+        default=3,
+        help="Run face recognition every N frames to reduce CPU load.",
+    )
+    parser.add_argument(
+        "--confirmation-frames",
+        type=int,
+        default=2,
+        help="Number of matching frames required before confirming exit.",
+    )
+    parser.add_argument(
+        "--detection-size",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=(480, 270),
+        help="Detection frame size used for face search.",
+    )
     return parser.parse_args()
 
 
@@ -42,6 +63,20 @@ def crop_face_with_padding(frame, face_location, padding=20):
         return None, None
 
     return face_crop, (x1, y1, x2, y2)
+
+
+def scale_face_location(face_location, from_shape, to_shape):
+    from_height, from_width = from_shape
+    to_height, to_width = to_shape
+    scale_x = to_width / max(from_width, 1)
+    scale_y = to_height / max(from_height, 1)
+    top, right, bottom, left = face_location
+    return (
+        int(round(top * scale_y)),
+        int(round(right * scale_x)),
+        int(round(bottom * scale_y)),
+        int(round(left * scale_x)),
+    )
 
 
 def draw_face_box(frame, face_box, label):
@@ -86,8 +121,11 @@ def show_matched_person(person_id, person_record):
     cv2.waitKey(2000)
 
 
-def main():
+def main(rtsp_url=None):
     args = parse_args()
+    if rtsp_url is not None:
+        args.rtsp = rtsp_url
+
     database = PeopleDatabase(args.database)
     total_in = len(database.get_inside_people())
     total_out = 0
@@ -95,11 +133,18 @@ def main():
     exit_cooldown_seconds = 3
     last_exit_times = {}
     last_unknown_warning_time = 0.0
+    exit_confirmation_counts = {}
+    frame_count = 0
 
     capture = cv2.VideoCapture(args.rtsp)
     if not capture.isOpened():
-        print("Error: Cannot connect to camera")
-        return
+        print("[WARNING] exit camera not connected, retrying...")
+        time.sleep(1.0)
+        capture.release()
+        capture = cv2.VideoCapture(args.rtsp)
+        if not capture.isOpened():
+            print("[ERROR] Cannot connect to camera")
+            return
 
     window_name = "Exit System"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -107,52 +152,105 @@ def main():
     try:
         try:
             while True:
-                ok, frame = capture.read()
-                if not ok:
-                    print("Frame read failed")
-                    continue
-
-                frame = resize_frame(frame, args.width)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb_frame)
-
-                for face_location in face_locations:
-                    face_crop, face_box = crop_face_with_padding(frame, face_location)
-                    new_encoding, _, _ = extract_face_encoding(face_crop)
-                    if new_encoding is None:
-                        continue
-
-                    person_id = match_person(new_encoding, db_path=args.database)
-                    now = time.time()
-                    if person_id is not None:
-                        if now - last_exit_times.get(person_id, 0.0) < exit_cooldown_seconds:
-                            draw_face_box(frame, face_box, person_id)
+                try:
+                    if not capture.isOpened():
+                        capture.release()
+                        time.sleep(1.0)
+                        capture = cv2.VideoCapture(args.rtsp)
+                        if not capture.isOpened():
+                            print("[WARNING] exit camera reconnect failed")
                             continue
 
-                        person_record = get_person(person_id, db_path=args.database)
-                        show_matched_person(person_id, person_record)
-                        image_path = person_record.get("image_path") if person_record is not None else None
-                        if image_path:
-                            threading.Thread(
-                                target=send_exit_to_api,
-                                args=(person_id, image_path),
-                                daemon=True,
-                            ).start()
-                        if remove_person(person_id, db_path=args.database):
-                            last_exit_times[person_id] = now
-                            total_out += 1
-                            current_inside = max(0, current_inside - 1)
-                            print(f"EXIT: {person_id}")
-                        draw_face_box(frame, face_box, person_id)
-                    else:
-                        if now - last_unknown_warning_time >= exit_cooldown_seconds:
-                            print("WARNING: Unknown person exiting")
-                            last_unknown_warning_time = now
-                        draw_face_box(frame, face_box, "Unknown")
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        print("[WARNING] exit frame read failed")
+                        capture.release()
+                        time.sleep(1.0)
+                        capture = cv2.VideoCapture(args.rtsp)
+                        continue
 
-                cv2.imshow(window_name, frame)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
+                    original_frame = frame
+                    frame_count += 1
+                    should_run_recognition = frame_count % args.recognition_interval == 0
+                    face_locations = []
+                    if should_run_recognition:
+                        detection_frame = cv2.resize(
+                            original_frame,
+                            tuple(args.detection_size),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        rgb_frame = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2RGB)
+                        small_face_locations = face_recognition.face_locations(rgb_frame, model="hog")
+                        face_locations = [
+                            scale_face_location(
+                                face_location,
+                                from_shape=detection_frame.shape[:2],
+                                to_shape=original_frame.shape[:2],
+                            )
+                            for face_location in small_face_locations
+                        ]
+
+                    for face_location in face_locations:
+                        face_crop, face_box = crop_face_with_padding(original_frame, face_location)
+                        new_encoding, _, _ = extract_face_encoding(face_crop)
+                        if new_encoding is None:
+                            continue
+
+                        person_id = database.match_person(new_encoding, threshold=0.47)
+                        now = time.time()
+                        if person_id is not None:
+                            exit_confirmation_counts[person_id] = (
+                                exit_confirmation_counts.get(person_id, 0) + 1
+                            )
+                            if exit_confirmation_counts[person_id] < args.confirmation_frames:
+                                draw_face_box(original_frame, face_box, person_id)
+                                continue
+
+                            exit_confirmation_counts[person_id] = 0
+                            if now - last_exit_times.get(person_id, 0.0) < exit_cooldown_seconds:
+                                draw_face_box(original_frame, face_box, person_id)
+                                continue
+
+                            person_record = database.get_person(person_id)
+                            show_matched_person(person_id, person_record)
+                            image_path = person_record.get("image_path") if person_record is not None else None
+                            if image_path:
+                                api_thread = threading.Thread(
+                                    target=send_exit_to_api,
+                                    args=(person_id, image_path),
+                                    daemon=True,
+                                )
+                                api_thread.start()
+                                api_thread.join(timeout=10)
+
+                            print("Deleting person:", person_id)
+                            if image_path and os.path.exists(image_path):
+                                os.remove(image_path)
+                                print(f"Deleted image: {image_path}")
+                            else:
+                                print("[ERROR] image not found")
+
+                            if database.remove_person(person_id):
+                                last_exit_times[person_id] = now
+                                total_out += 1
+                                current_inside = max(0, current_inside - 1)
+                                print(f"[EXIT] {person_id} removed | Count: {current_inside}")
+                            draw_face_box(original_frame, face_box, person_id)
+                        else:
+                            exit_confirmation_counts.clear()
+                            if now - last_unknown_warning_time >= exit_cooldown_seconds:
+                                print("[WARNING] unknown person")
+                                last_unknown_warning_time = now
+                            draw_face_box(original_frame, face_box, "Unknown")
+
+                    display_frame = resize_frame(original_frame, args.width)
+                    cv2.imshow(window_name, display_frame)
+                    time.sleep(0.01)
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        break
+                except Exception as exc:
+                    print(f"[ERROR] exit frame processing failed: {exc}")
+                    time.sleep(0.1)
         except KeyboardInterrupt:
             print("Stopping system safely")
     finally:

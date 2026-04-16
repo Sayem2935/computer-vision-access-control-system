@@ -17,7 +17,7 @@ def send_entry_to_api(person_id, image_path):
 
     try:
         if not image_path or not os.path.exists(image_path):
-            print(f"API send failed: image not found for {person_id}")
+            print("[ERROR] image not found")
             return
 
         with open(image_path, "rb") as img:
@@ -30,10 +30,10 @@ def send_entry_to_api(person_id, image_path):
                 files=files,
                 timeout=10,
             )
-        print(f"API status: {response.status_code}")
-        print(f"API message: {response.text}")
+        print(f"ENTRY API status: {response.status_code}")
+        print(f"ENTRY API response: {response.text}")
     except Exception as exc:
-        print(f"API send failed: {exc}")
+        print(f"[ERROR] entry api failed: {exc}")
 
 
 def send_exit_to_api(person_id, image_path):
@@ -45,7 +45,7 @@ def send_exit_to_api(person_id, image_path):
 
     try:
         if not image_path or not os.path.exists(image_path):
-            print(f"EXIT API send failed: image not found for {person_id}")
+            print("[ERROR] image not found")
             return
 
         with open(image_path, "rb") as img:
@@ -61,4 +61,4 @@ def send_exit_to_api(person_id, image_path):
         print("EXIT API status:", response.status_code)
         print("EXIT API response:", response.text)
     except Exception as exc:
-        print(f"EXIT API send failed: {exc}")
+        print(f"[ERROR] exit api failed: {exc}")

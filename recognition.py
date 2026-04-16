@@ -11,7 +11,8 @@ known_encodings = []
 known_ids = []
 person_count = 0
 FACE_MATCH_THRESHOLD = 0.47
-MIN_FACE_SIZE = 80
+MIN_FACE_SIZE = 60
+MIN_FACE_WIDTH_FOR_ENCODING = 60
 NORMALIZED_FACE_SIZE = (150, 150)
 MAX_ENCODINGS_PER_PERSON = 5
 MAX_SAVE_RETRIES = 3
@@ -62,12 +63,33 @@ def extract_face_encoding(face_img):
     if face_img.shape[0] < MIN_FACE_SIZE or face_img.shape[1] < MIN_FACE_SIZE:
         return None, None, None
 
-    rgb_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-    face_locations = face_recognition.face_locations(rgb_img)
+    detection_img = cv2.resize(
+        face_img,
+        None,
+        fx=1.5,
+        fy=1.5,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    rgb_img = cv2.cvtColor(detection_img, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_img, model="hog")
     if not face_locations:
         return None, None, None
 
-    face_location = face_locations[0]
+    detection_face_location = max(
+        face_locations,
+        key=lambda location: (location[1] - location[3]) * (location[2] - location[0]),
+    )
+    face_location = scale_face_location(
+        detection_face_location,
+        scale_x=face_img.shape[1] / detection_img.shape[1],
+        scale_y=face_img.shape[0] / detection_img.shape[0],
+        max_width=face_img.shape[1],
+        max_height=face_img.shape[0],
+    )
+    top, right, bottom, left = face_location
+    if (right - left) < MIN_FACE_WIDTH_FOR_ENCODING:
+        return None, None, None
+
     normalized_face = crop_face_region(
         face_img,
         face_location,
@@ -94,12 +116,25 @@ def get_face_location(face_img):
     if face_img is None or face_img.size == 0:
         return None
 
-    rgb_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-    face_locations = face_recognition.face_locations(rgb_face)
+    detection_img = cv2.resize(
+        face_img,
+        None,
+        fx=1.5,
+        fy=1.5,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    rgb_face = cv2.cvtColor(detection_img, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_face, model="hog")
     if not face_locations:
         return None
 
-    top, right, bottom, left = face_locations[0]
+    top, right, bottom, left = scale_face_location(
+        face_locations[0],
+        scale_x=face_img.shape[1] / detection_img.shape[1],
+        scale_y=face_img.shape[0] / detection_img.shape[0],
+        max_width=face_img.shape[1],
+        max_height=face_img.shape[0],
+    )
     return left, top, right, bottom
 
 
@@ -120,15 +155,19 @@ def match_face_encoding(encoding, threshold=FACE_MATCH_THRESHOLD):
     best_index = None
     best_distance = None
     for index, person_encodings in enumerate(known_encodings):
-        distances = face_recognition.face_distance(person_encodings, encoding)
+        encoding_matrix = np.asarray(person_encodings, dtype=np.float64)
+        distances = np.linalg.norm(encoding_matrix - encoding, axis=1)
         min_distance = float(np.min(distances))
         if best_distance is None or min_distance < best_distance:
             best_index = index
             best_distance = min_distance
 
     if best_distance is not None and best_distance < threshold:
+        print("Matching distance:", best_distance)
         return known_ids[best_index], best_distance
 
+    if best_distance is not None:
+        print("Matching distance:", best_distance)
     return None, best_distance
 
 
@@ -140,6 +179,8 @@ def create_person_from_encoding(encoding, face_crop=None):
     known_encodings.append([encoding])
     known_ids.append(person_id)
     ensure_face_saved(person_id, face_crop)
+    if not has_face_image(person_id) and face_crop is not None and face_crop.size != 0:
+        save_face_image(person_id, face_crop)
     return person_id
 
 
@@ -154,6 +195,16 @@ def remember_person_encoding(person_id, encoding, face_crop=None):
     if len(person_encodings) > MAX_ENCODINGS_PER_PERSON:
         del person_encodings[:-MAX_ENCODINGS_PER_PERSON]
 
+    ensure_face_saved(person_id, face_crop)
+
+
+def cache_known_person(person_id, encoding, face_crop=None):
+    if person_id in known_ids:
+        remember_person_encoding(person_id, encoding, face_crop=face_crop)
+        return
+
+    known_ids.append(person_id)
+    known_encodings.append([encoding])
     ensure_face_saved(person_id, face_crop)
 
 
@@ -189,6 +240,15 @@ def crop_face_region(face_img, face_location, padding=20, resize_to=None):
     return face_crop
 
 
+def scale_face_location(face_location, scale_x, scale_y, max_width, max_height):
+    top, right, bottom, left = face_location
+    scaled_top = max(0, min(int(round(top * scale_y)), max_height - 1))
+    scaled_right = max(0, min(int(round(right * scale_x)), max_width))
+    scaled_bottom = max(0, min(int(round(bottom * scale_y)), max_height))
+    scaled_left = max(0, min(int(round(left * scale_x)), max_width - 1))
+    return scaled_top, scaled_right, scaled_bottom, scaled_left
+
+
 def ensure_face_saved(person_id, face_crop):
     if face_crop is None or face_crop.size == 0:
         return
@@ -205,6 +265,8 @@ def ensure_face_saved(person_id, face_crop):
     add_face_sample(person_id, face_crop)
     samples = face_samples.get(person_id, [])
     if len(samples) < MIN_FACE_SAMPLES:
+        if attempts >= MAX_SAVE_RETRIES - 1:
+            save_face_image(person_id, face_crop)
         return
 
     best_face = max(samples, key=lambda sample: sample["score"])["image"]
@@ -235,9 +297,13 @@ def save_face_image(person_id, face_crop):
         return
 
     os.makedirs(FACES_DIR, exist_ok=True)
+    print("Saving image for:", person_id)
     resized_face = cv2.resize(face_crop, NORMALIZED_FACE_SIZE)
     if cv2.imwrite(image_path, resized_face):
         print(f"Saved face for {person_id}")
+        print(f"Image saved at: {image_path}")
+    if not os.path.exists(image_path):
+        print("[ERROR] image not saved")
 
 
 def add_face_sample(person_id, face_crop):

@@ -40,6 +40,14 @@ def resize_frame(frame, target_width):
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
+def apply_best_effort_camera_settings(capture):
+    if hasattr(cv2, "CAP_PROP_SHARPNESS"):
+        capture.set(cv2.CAP_PROP_SHARPNESS, 180)
+
+    if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+        capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+
+
 class CameraStream:
     def __init__(
         self,
@@ -74,6 +82,7 @@ class CameraStream:
         else:
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        apply_best_effort_camera_settings(capture)
 
         width = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
         height = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)

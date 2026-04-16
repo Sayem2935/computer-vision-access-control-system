@@ -1,14 +1,11 @@
 import os
-import shutil
 import sqlite3
 from datetime import datetime
 
-import face_recognition
 import numpy as np
 
 
 DB_PATH = "people.db"
-EXITED_FACES_DIR = "exited_faces"
 FACES_DIR = "faces"
 
 
@@ -37,10 +34,14 @@ def init_db(db_path=DB_PATH):
 class PeopleDatabase:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
+        self._cached_encodings = np.empty((0, 128), dtype=np.float64)
+        self._cached_person_ids = []
+        self._cache_mtime = None
         self.initialize()
 
     def initialize(self):
         init_db(self.db_path)
+        self.refresh_cache()
 
     def close(self):
         return None
@@ -76,7 +77,9 @@ class PeopleDatabase:
             connection.close()
 
         if encoding_bytes is not None:
+            self._upsert_cached_encoding(person_id, encoding)
             print(f"Encoding saved for {person_id}")
+        self._update_cache_mtime()
         print(f"Linked image {image_path} with {person_id}")
         if print_log:
             print(f"Saved to DB: {person_id}")
@@ -85,16 +88,6 @@ class PeopleDatabase:
     def remove_person(self, person_id):
         connection = self._connect()
         try:
-            person = connection.execute(
-                """
-                SELECT image_path
-                FROM people_inside
-                WHERE person_id = ?
-                """,
-                (person_id,),
-            ).fetchone()
-
-            image_path = person["image_path"] if person is not None else None
             result = connection.execute(
                 """
                 DELETE FROM people_inside
@@ -109,12 +102,9 @@ class PeopleDatabase:
         if result.rowcount == 0:
             return False
 
+        self._remove_cached_encoding(person_id)
+        self._update_cache_mtime()
         print(f"Removed from DB: {person_id}")
-        if image_path and os.path.exists(image_path):
-            os.makedirs(EXITED_FACES_DIR, exist_ok=True)
-            destination_path = os.path.join(EXITED_FACES_DIR, os.path.basename(image_path))
-            shutil.move(image_path, destination_path)
-            print(f"Moved {person_id} image to exited_faces")
         return True
 
     def get_inside_people(self):
@@ -180,21 +170,25 @@ class PeopleDatabase:
 
         return encodings, person_ids
 
-    def match_person(self, new_encoding, threshold=0.45):
-        encodings, person_ids = self.load_all_people()
-        if not encodings:
+    def match_person(self, new_encoding, threshold=0.47):
+        self._refresh_cache_if_needed()
+        if self._cached_encodings.size == 0:
             print("DB distances: []")
             return None
 
-        distances = face_recognition.face_distance(encodings, new_encoding)
-        debug_values = [f"{person_id}={distance:.3f}" for person_id, distance in zip(person_ids, distances)]
+        distances = np.linalg.norm(self._cached_encodings - new_encoding, axis=1)
+        debug_values = [
+            f"{person_id}={distance:.3f}"
+            for person_id, distance in zip(self._cached_person_ids, distances)
+        ]
         print(f"DB distances: {debug_values}")
 
         best_index = int(np.argmin(distances))
         best_distance = float(distances[best_index])
+        print("Matching distance:", best_distance)
 
         if best_distance < threshold:
-            return person_ids[best_index]
+            return self._cached_person_ids[best_index]
 
         return None
 
@@ -217,6 +211,63 @@ class PeopleDatabase:
         connection = sqlite3.connect(self.db_path, timeout=10)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def refresh_cache(self):
+        encodings, person_ids = self.load_all_people()
+        if encodings:
+            self._cached_encodings = np.asarray(encodings, dtype=np.float64)
+            self._cached_person_ids = list(person_ids)
+        else:
+            self._cached_encodings = np.empty((0, 128), dtype=np.float64)
+            self._cached_person_ids = []
+        self._update_cache_mtime()
+
+    def _upsert_cached_encoding(self, person_id, encoding):
+        if encoding is None:
+            return
+
+        encoding = np.asarray(encoding, dtype=np.float64)
+        if encoding.shape != (128,):
+            return
+
+        try:
+            person_index = self._cached_person_ids.index(person_id)
+        except ValueError:
+            self._cached_person_ids.append(person_id)
+            if self._cached_encodings.size == 0:
+                self._cached_encodings = encoding.reshape(1, 128)
+            else:
+                self._cached_encodings = np.vstack((self._cached_encodings, encoding))
+            return
+
+        self._cached_encodings[person_index] = encoding
+
+    def _remove_cached_encoding(self, person_id):
+        try:
+            person_index = self._cached_person_ids.index(person_id)
+        except ValueError:
+            return
+
+        self._cached_person_ids.pop(person_index)
+        if not self._cached_person_ids:
+            self._cached_encodings = np.empty((0, 128), dtype=np.float64)
+            return
+
+        self._cached_encodings = np.delete(self._cached_encodings, person_index, axis=0)
+
+    def _refresh_cache_if_needed(self):
+        current_mtime = self._get_db_mtime()
+        if current_mtime != self._cache_mtime:
+            self.refresh_cache()
+
+    def _update_cache_mtime(self):
+        self._cache_mtime = self._get_db_mtime()
+
+    def _get_db_mtime(self):
+        try:
+            return os.path.getmtime(self.db_path)
+        except OSError:
+            return None
 
 
 def add_person(person_id, encoding, image_path, db_path=DB_PATH):

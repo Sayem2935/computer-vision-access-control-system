@@ -2,7 +2,7 @@ import cv2
 
 
 CAMERA_1_RTSP = "rtsp://admin:Shuborno%40500@192.168.0.200:554/Streaming/Channels/102"
-CAMERA_2_RTSP = "rtsp://admin:YOUR_PASSWORD@192.168.0.174:554/cam/realmonitor?channel=1&subtype=1"
+CAMERA_2_RTSP = "rtsp://admin:Shuborno%40500@192.168.0.201:554/Streaming/Channels/102"
 FRAME_SIZE = (640, 480)
 
 

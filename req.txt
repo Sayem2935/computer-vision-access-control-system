@@ -1,0 +1,90 @@
+Check if Homebrew is installed on Mac.
+
+If not installed, install Homebrew using official command.
+
+Verify installation using:
+brew --version
+
+
+Install Python 3 using Homebrew.
+
+Command:
+brew install python
+
+Verify:
+python3 --version
+
+
+
+Create virtual environment inside project folder.
+
+Commands:
+
+cd Park_project_2.0
+python3 -m venv venv
+
+Activate:
+source venv/bin/activate
+
+Goal:
+Isolate project dependencies
+
+
+Install all required Python packages for the project.
+
+Command:
+
+pip install ultralytics opencv-python face_recognition numpy pandas fastapi uvicorn requests
+
+If face_recognition fails, install:
+
+brew install cmake
+brew install dlib
+
+Then run:
+pip install face_recognition
+
+Goal:
+Install all dependencies successfully
+
+
+
+
+Verify both cameras are reachable.
+
+Run:
+
+ping 192.168.0.200
+ping 192.168.0.201
+
+Open browser:
+http://192.168.0.200
+http://192.168.0.201
+
+Goal:
+Ensure cameras are accessible before running system
+
+
+pip install opencv-python
+
+brew install dlib
+pip install face_recognition
+
+cd Park_project_2.0
+source venv/bin/activate
+python dual_camera_system.py
+
+
+sqlite3 people.db
+
+CREATE TABLE people_inside (
+    person_id TEXT PRIMARY KEY,
+    encoding BLOB,
+    image_path TEXT,
+    entry_time TEXT
+);
+.exit
+
+db browser for sqlite
+rm -f people.db
+
